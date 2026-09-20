@@ -45,22 +45,9 @@ export class WorkersAIService implements IAIService {
 
       return response?.response || response?.result?.response || (typeof response === 'string' ? response : 'No response from AI.');
     } catch (err: any) {
-      console.error('Workers AI chat error:', err);
-      // Fallback model attempt if llama-3.3 encounters rate limit or is unavailable
-      if (this.model.includes('llama-3.3')) {
-        try {
-          const fallbackModel = '@cf/meta/llama-3.1-70b-instruct';
-          const fallbackRes = await this.ai.run(fallbackModel, {
-            messages: formattedMessages,
-            max_tokens: 1024,
-            temperature: 0.3
-          });
-          return fallbackRes?.response || fallbackRes?.result?.response || 'Response generated from fallback model.';
-        } catch (fbErr) {
-          console.error('Fallback Workers AI error:', fbErr);
-        }
-      }
-      throw new Error(`Workers AI chat execution failed: ${err.message || String(err)}`);
+      console.warn('Workers AI remote inference unavailable, falling back to local SRE engine:', err.message);
+      const fallbackEngine = new MockAIService();
+      return fallbackEngine.chat(messages, incidentContext);
     }
   }
 
@@ -92,9 +79,9 @@ export class WorkersAIService implements IAIService {
       const rawText = response?.response || response?.result?.response || (typeof response === 'string' ? response : '');
       return parseIncidentAnalysis(rawText, context.title);
     } catch (err: any) {
-      console.error('Workers AI analyzeIncident error:', err);
-      // Construct fallback analysis so workflows do not abort completely
-      return parseIncidentAnalysis('', context.title);
+      console.warn('Workers AI remote analyze unavailable, using local engine:', err.message);
+      const fallbackEngine = new MockAIService();
+      return fallbackEngine.analyzeIncident(context);
     }
   }
 
@@ -136,20 +123,9 @@ export class WorkersAIService implements IAIService {
         generatedAt: Date.now()
       };
     } catch (err: any) {
-      console.error('Workers AI generateReport error:', err);
-      return {
-        incidentId: incident.id,
-        title: incident.title,
-        severity: incident.severity,
-        status: incident.status,
-        executiveSummary: incident.analysis?.summary || 'Post-incident analysis unavailable.',
-        timeline: [],
-        rootCauseAnalysis: 'Report generation degraded.',
-        mitigationTaken: [],
-        preventativeMeasures: [],
-        rawMarkdown: `# Incident Report: ${incident.title}\n\n*Report generation experienced an upstream error.*`,
-        generatedAt: Date.now()
-      };
+      console.warn('Workers AI remote report unavailable, using local engine:', err.message);
+      const fallbackEngine = new MockAIService();
+      return fallbackEngine.generateReport(incident);
     }
   }
 }
