@@ -153,27 +153,36 @@ export default {
           return errorResponse('Field "message" is required', 400);
         }
 
+        console.log(`[API] 1. Received user message for incident ${incidentId}: "${body.message.trim()}"`);
+
         // Add user message to persistent DO
         const userMsg = await stub.addMessage('user', body.message.trim());
-        const state = await stub.getState();
-        if (!state) {
+        const stateAfterUserMsg = await stub.getState();
+        if (!stateAfterUserMsg) {
           return errorResponse('Incident state not found', 404);
         }
+        console.log(`[DO] 2. Persisted conversation messages count: ${stateAfterUserMsg.messages.length}`);
+
+        // Retrieve messages before AI generation
+        const context = await stub.getContextForAI();
+        console.log(`[DO] 3. Messages retrieved before AI generation:`, JSON.stringify(context.messages.map(m => ({ role: m.role, content: m.content }))));
 
         // Generate AI response using bounded context window
         const ai = getAIService(env);
-        const context = await stub.getContextForAI();
-        const aiReply = await ai.chat(context.messages, state);
+        const aiReply = await ai.chat(context.messages, stateAfterUserMsg);
 
         // Add assistant message to DO
         const assistantMsg = await stub.addMessage('assistant', aiReply);
 
-        // Update structured analysis asynchronously to reflect newest facts
+        // Fetch latest state containing both user and assistant turns for analysis
+        const stateAfterAssistant = await stub.getState();
         const updatedAnalysis = await ai.analyzeIncident({
-          title: state.title,
-          messages: state.messages,
-          currentAnalysis: state.analysis
+          title: stateAfterAssistant?.title || stateAfterUserMsg.title,
+          messages: stateAfterAssistant?.messages || [...stateAfterUserMsg.messages, assistantMsg],
+          currentAnalysis: stateAfterAssistant?.analysis || stateAfterUserMsg.analysis
         });
+        console.log(`[API] 6. Parsed structured response:`, JSON.stringify(updatedAnalysis));
+
         const updatedState = await stub.updateAnalysis(updatedAnalysis);
         await syncRegistry(env, updatedState);
 

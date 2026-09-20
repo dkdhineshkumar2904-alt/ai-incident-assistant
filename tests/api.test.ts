@@ -178,6 +178,78 @@ describe('Incident Assistant API Router', () => {
     expect(reportJson.data.preventativeMeasures.length).toBeGreaterThan(0);
   });
 
+  it('handles multi-turn conversation sequence without repeating responses and incorporates newly provided entities (OMS sequence)', async () => {
+    const { env, ctx } = createMockEnvironment();
+
+    // 1. Create session
+    const createReq = new Request('http://localhost/api/incidents', {
+      method: 'POST',
+      body: JSON.stringify({ title: 'API Performance Degradation' })
+    });
+    const createRes = await worker.fetch(createReq, env, ctx);
+    const incident = ((await createRes.json()) as any).data;
+
+    // Turn 1: User says "Production API is slow"
+    const turn1Req = new Request(`http://localhost/api/incidents/${incident.id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'Production API is slow' })
+    });
+    const turn1Res = await worker.fetch(turn1Req, env, ctx);
+    expect(turn1Res.status).toBe(200);
+    const turn1Json = (await turn1Res.json()) as any;
+    const reply1 = turn1Json.data.assistantMessage.content;
+    expect(reply1).toContain('latency');
+    expect(reply1).toContain('service');
+
+    // Turn 2: User answers "oms"
+    const turn2Req = new Request(`http://localhost/api/incidents/${incident.id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'oms' })
+    });
+    const turn2Res = await worker.fetch(turn2Req, env, ctx);
+    expect(turn2Res.status).toBe(200);
+    const turn2Json = (await turn2Res.json()) as any;
+    const reply2 = turn2Json.data.assistantMessage.content;
+
+    // Crucial requirement: Reply 2 MUST NOT be identical to Reply 1
+    expect(reply2).not.toBe(reply1);
+    // Crucial requirement: Reply 2 acknowledges OMS
+    expect(reply2).toContain('OMS');
+    expect(reply2).toContain('affected service is OMS');
+
+    // Turn 3: User clarifies "microservice name: oms"
+    const turn3Req = new Request(`http://localhost/api/incidents/${incident.id}/messages`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: 'microservice name: oms' })
+    });
+    const turn3Res = await worker.fetch(turn3Req, env, ctx);
+    expect(turn3Res.status).toBe(200);
+    const turn3Json = (await turn3Res.json()) as any;
+    const reply3 = turn3Json.data.assistantMessage.content;
+
+    // Crucial requirement: All three responses must be distinct
+    expect(reply3).not.toBe(reply1);
+    expect(reply3).not.toBe(reply2);
+    // Crucial requirement: Reply 3 incorporates confirmed microservice OMS and advances triage
+    expect(reply3).toContain('microservice is OMS');
+    expect(reply3).toContain('endpoint');
+
+    // Verify conversation state contains all 6 turns in order
+    const fullHistoryReq = new Request(`http://localhost/api/incidents/${incident.id}/messages`);
+    const historyRes = await worker.fetch(fullHistoryReq, env, ctx);
+    const historyJson = (await historyRes.json()) as any;
+    expect(historyJson.data).toHaveLength(6);
+    expect(historyJson.data[0].role).toBe('user');
+    expect(historyJson.data[1].role).toBe('assistant');
+    expect(historyJson.data[2].role).toBe('user');
+    expect(historyJson.data[3].role).toBe('assistant');
+    expect(historyJson.data[4].role).toBe('user');
+    expect(historyJson.data[5].role).toBe('assistant');
+  });
+
   it('returns 404 for unknown endpoints', async () => {
     const { env, ctx } = createMockEnvironment();
     const req = new Request('http://localhost/api/nonexistent-path');

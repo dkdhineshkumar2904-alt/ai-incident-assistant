@@ -16,7 +16,12 @@ OPERATING PRINCIPLES:
    - Provide concrete, non-destructive investigation commands or diagnostic queries.
    - Propose safe mitigation first (e.g., rollback, shedding non-critical load, rate limiting) to restore availability before deep root-cause debugging.
 6. Targeted Inquiries: Ask at most 2-3 focused, high-yield diagnostic questions at a time to narrow down the problem quickly.
-7. Tone & Style: Calm, professional, concise, structured, and razor-focused on rapid incident triage and mitigation.`;
+7. Tone & Style: Calm, professional, concise, structured, and razor-focused on rapid incident triage and mitigation.
+8. Conversational Continuity & Incremental Triage:
+   - Review all previous turns in the conversation.
+   - When the user answers a question you previously asked (such as providing an affected microservice name like 'OMS', an endpoint, error code, or latency numbers), immediately acknowledge and incorporate that specific answer (e.g. 'Got it — the affected service is OMS.').
+   - NEVER repeat your previous response or re-ask questions that were already answered.
+   - Move the investigation forward based on the newest piece of evidence provided.`;
 
 export const STRUCTURED_ANALYSIS_PROMPT = `Analyze the current incident transcript and return a structured JSON assessment.
 You MUST output ONLY a valid JSON object with NO surrounding conversational prose. Do not include introductory text like "Here is the analysis:".
@@ -43,31 +48,54 @@ export function formatChatContext(
   messages: ChatMessage[],
   incidentContext?: Partial<IncidentState>
 ): Array<{ role: string; content: string }> {
-  const formatted: Array<{ role: string; content: string }> = [
-    { role: 'system', content: SYSTEM_PROMPT_SENIOR_SRE }
-  ];
+  // 1. Single unified system message to prevent multi-system prompt rejection in Llama 3
+  let systemContent = SYSTEM_PROMPT_SENIOR_SRE;
 
   if (incidentContext) {
-    let contextBanner = `[ACTIVE INCIDENT CONTEXT]\nIncident ID: ${incidentContext.id || 'N/A'}\nTitle: ${incidentContext.title || 'Untitled Incident'}\nCurrent Severity: ${incidentContext.severity || 'UNKNOWN'}\nStatus: ${incidentContext.status || 'INVESTIGATING'}`;
+    let contextBanner = `\n\n[ACTIVE INCIDENT CONTEXT]\nIncident ID: ${incidentContext.id || 'N/A'}\nTitle: ${incidentContext.title || 'Untitled Incident'}\nCurrent Severity: ${incidentContext.severity || 'UNKNOWN'}\nStatus: ${incidentContext.status || 'INVESTIGATING'}`;
     
     if (incidentContext.analysis) {
-      contextBanner += `\nIdentified Symptoms: ${incidentContext.analysis.symptoms.join(', ')}`;
-      contextBanner += `\nLeading Hypotheses: ${incidentContext.analysis.possibleRootCauses.slice(0, 2).join('; ')}`;
+      if (incidentContext.analysis.symptoms?.length) {
+        contextBanner += `\nIdentified Symptoms: ${incidentContext.analysis.symptoms.join(', ')}`;
+      }
+      if (incidentContext.analysis.possibleRootCauses?.length) {
+        contextBanner += `\nLeading Hypotheses: ${incidentContext.analysis.possibleRootCauses.slice(0, 2).join('; ')}`;
+      }
     }
-    
-    formatted.push({
-      role: 'system',
-      content: contextBanner
+    systemContent += contextBanner;
+  }
+
+  const formatted: Array<{ role: string; content: string }> = [
+    { role: 'system', content: systemContent }
+  ];
+
+  // 2. Normalize and order recent messages within token budget (last 10 messages)
+  const recentMessages = messages.slice(-10);
+  const normalizedTurns: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+
+  for (const msg of recentMessages) {
+    // Map system event messages into the conversation stream safely
+    const role: 'user' | 'assistant' = msg.role === 'assistant' ? 'assistant' : 'user';
+    const content = msg.role === 'system' ? `[SYSTEM NOTIFICATION]: ${msg.content}` : msg.content;
+
+    if (normalizedTurns.length > 0 && normalizedTurns[normalizedTurns.length - 1].role === role) {
+      // Merge consecutive identical roles to enforce strict alternating turns for Llama 3
+      normalizedTurns[normalizedTurns.length - 1].content += `\n\n${content}`;
+    } else {
+      normalizedTurns.push({ role, content });
+    }
+  }
+
+  // Ensure first dialogue turn is from 'user'
+  if (normalizedTurns.length > 0 && normalizedTurns[0].role !== 'user') {
+    normalizedTurns.unshift({
+      role: 'user',
+      content: 'I need assistance triaging this active production incident.'
     });
   }
 
-  // Pass latest messages within token budget (last 10 messages)
-  const recentMessages = messages.slice(-10);
-  for (const msg of recentMessages) {
-    formatted.push({
-      role: msg.role === 'system' ? 'system' : msg.role === 'assistant' ? 'assistant' : 'user',
-      content: msg.content
-    });
+  for (const turn of normalizedTurns) {
+    formatted.push(turn);
   }
 
   return formatted;

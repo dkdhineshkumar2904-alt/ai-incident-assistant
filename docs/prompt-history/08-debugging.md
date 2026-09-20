@@ -1,7 +1,7 @@
 # 08 - Debugging & Resolution Log
 
 ## Focus
-Documenting errors encountered during TypeScript compilation and Vitest execution, and the exact architectural resolutions applied.
+Documenting errors encountered during TypeScript compilation, Vitest execution, and runtime conversational flow, and the exact architectural resolutions applied.
 
 ---
 
@@ -37,3 +37,19 @@ Documenting errors encountered during TypeScript compilation and Vitest executio
   `tests/ai-parser.test.ts` expected heuristic recovery for text mentioning "500 errors" to produce `HIGH` severity, but received `MEDIUM`.
 - **Root Cause**: `normalizeSeverity` checked for `CRITICAL`, `HIGH`, `P0`, `SEV-1`, but did not include `'500'` in the `HIGH` severity detection regex.
 - **Fix**: Updated `normalizeSeverity` in `src/ai/parser.ts` to include `upper.includes('500')`, appropriately classifying HTTP 500 errors as `HIGH` severity.
+
+---
+
+### Issue 4: Conversational Repetition & Ignored User Messages (OMS Latency Sequence)
+- **Symptom**:
+  When a user said *"Production API's are dead slow..."*, the AI asked for service name/telemetry. When the user answered *"oms"* or *"microservice name : oms"*, the assistant repeatedly produced the identical response asking for the service name again, effectively ignoring new user messages.
+- **Root Cause**:
+  1. **Local Dev Fallback**: In local development without live Cloudflare remote credentials, Workers AI binding (`env.AI`) errors with `Binding AI needs to be run remotely`, routing execution to `MockAIService`.
+  2. **Stateless Fallback Template**: `MockAIService.chat` inspected only `messages[messages.length - 1]` with crude keyword filters (`500`, `db`). For any other input (like `"oms"` or `"microservice name : oms"`), it defaulted to a static fallback template asking for the service name, ignoring the entire conversation history and previously asked questions.
+  3. **Llama 3 Multi-System Prompt Issue**: `formatChatContext` passed multiple consecutive `{ role: 'system' }` messages to the LLM, violating Llama 3 alternating turn requirements and causing prompt reset.
+- **Fix**:
+  1. Built an entity- and dialogue-aware conversation state engine in `MockAIService` that evaluates the full transcript, tracks user answers to previous assistant questions, extracts microservices (`OMS`, `payment`, etc.), and progresses triage logically without repeating previous assistant turns.
+  2. Refactored `formatChatContext` in `src/ai/prompts.ts` to combine system instructions and incident context into a single system message, map internal system notifications into user turns, and merge consecutive turns of identical roles.
+  3. Added explicit conversational continuity instructions to `SYSTEM_PROMPT_SENIOR_SRE`.
+  4. Implemented all 7 required logging checkpoints in `src/index.ts` and `src/ai/ai-service.ts`.
+  5. Added an automated end-to-end multi-turn test in `tests/api.test.ts` verifying that `"Production API is slow"` -> `"oms"` -> `"microservice name: oms"` yields three distinct, progressive responses incorporating OMS.

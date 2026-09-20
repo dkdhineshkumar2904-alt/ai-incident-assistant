@@ -35,6 +35,7 @@ export class WorkersAIService implements IAIService {
 
   async chat(messages: ChatMessage[], incidentContext?: Partial<IncidentState>): Promise<string> {
     const formattedMessages = formatChatContext(messages, incidentContext);
+    console.log('[AI] 4. Final AI prompt/context sent to model:', JSON.stringify(formattedMessages, null, 2));
 
     try {
       const response = await this.ai.run(this.model, {
@@ -43,9 +44,15 @@ export class WorkersAIService implements IAIService {
         temperature: 0.3
       });
 
-      return response?.response || response?.result?.response || (typeof response === 'string' ? response : 'No response from AI.');
+      const rawResponse =
+        response?.response ||
+        response?.result?.response ||
+        (typeof response === 'string' ? response : 'No response from AI.');
+
+      console.log('[AI] 5. Workers AI response:', rawResponse);
+      return rawResponse;
     } catch (err: any) {
-      console.warn('Workers AI remote inference unavailable, falling back to local SRE engine:', err.message);
+      console.warn('[AI] 7. Fallback/error path: Workers AI execution failed, invoking fallback SRE engine:', err.message);
       const fallbackEngine = new MockAIService();
       return fallbackEngine.chat(messages, incidentContext);
     }
@@ -77,9 +84,11 @@ export class WorkersAIService implements IAIService {
       });
 
       const rawText = response?.response || response?.result?.response || (typeof response === 'string' ? response : '');
-      return parseIncidentAnalysis(rawText, context.title);
+      const analysis = parseIncidentAnalysis(rawText, context.title);
+      console.log('[AI] 6. Parsed structured response from Workers AI:', JSON.stringify(analysis, null, 2));
+      return analysis;
     } catch (err: any) {
-      console.warn('Workers AI remote analyze unavailable, using local engine:', err.message);
+      console.warn('[AI] 7. Fallback/error path: Workers AI analyze failed, invoking fallback SRE engine:', err.message);
       const fallbackEngine = new MockAIService();
       return fallbackEngine.analyzeIncident(context);
     }
@@ -123,18 +132,121 @@ export class WorkersAIService implements IAIService {
         generatedAt: Date.now()
       };
     } catch (err: any) {
-      console.warn('Workers AI remote report unavailable, using local engine:', err.message);
+      console.warn('[AI] 7. Fallback/error path: Workers AI report failed, invoking fallback SRE engine:', err.message);
       const fallbackEngine = new MockAIService();
       return fallbackEngine.generateReport(incident);
     }
   }
 }
 
+/**
+ * Intelligent conversation state engine used for local dev and automated tests.
+ * Maintains full awareness of conversation history, user answers, and entity extraction.
+ */
 export class MockAIService implements IAIService {
   async chat(messages: ChatMessage[], incidentContext?: Partial<IncidentState>): Promise<string> {
-    const lastMsg = messages[messages.length - 1]?.content.toLowerCase() || '';
+    if (!messages || messages.length === 0) {
+      return 'I am ready to assist. Please describe the incident symptoms or anomalies observed.';
+    }
 
-    if (lastMsg.includes('500') || lastMsg.includes('deploy')) {
+    const previousAssistantResponses = messages
+      .filter(m => m.role === 'assistant')
+      .map(m => m.content);
+
+    const lastAssistantMsg = previousAssistantResponses.length > 0
+      ? previousAssistantResponses[previousAssistantResponses.length - 1]
+      : '';
+
+    const userMessages = messages.filter(m => m.role === 'user');
+    const lastUserMsgObj = userMessages[userMessages.length - 1];
+    const latestUserText = (lastUserMsgObj?.content || '').trim();
+    const latestLower = latestUserText.toLowerCase();
+
+    // Full conversation text for context extraction
+    const fullTranscript = messages.map(m => m.content).join('\n');
+    const transcriptLower = fullTranscript.toLowerCase();
+
+    // 1. Extract mentioned microservice name (e.g. OMS, payment, auth, orders)
+    let detectedService: string | null = null;
+    const serviceMatch = fullTranscript.match(/(?:microservice(?:\s*name)?\s*[:=]?\s*|service\s*[:=]?\s*|\b)([A-Za-z0-9_-]{2,15})\b/i);
+    
+    // Check specific user tokens for short answers like "oms"
+    for (const uMsg of userMessages) {
+      const uText = uMsg.content.trim();
+      const uLower = uText.toLowerCase();
+      if (/^oms\b/i.test(uText) || /microservice\s*(?:name)?\s*[:=]?\s*oms/i.test(uText)) {
+        detectedService = 'OMS';
+        break;
+      }
+      if (/^(payment|auth|checkout|billing|gateway|inventory|order|shipping)\b/i.test(uLower)) {
+        detectedService = uText.toUpperCase();
+        break;
+      }
+    }
+
+    if (!detectedService && serviceMatch && serviceMatch[1]) {
+      const candidate = serviceMatch[1].toUpperCase();
+      if (['OMS', 'PAYMENT', 'AUTH', 'CHECKOUT', 'BILLING'].includes(candidate)) {
+        detectedService = candidate;
+      }
+    }
+
+    // 2. Identify conversational turns & user answers
+    const isLatencyIssue = transcriptLower.includes('latency') || transcriptLower.includes('slow') || transcriptLower.includes('response time');
+    const is500Issue = transcriptLower.includes('500') || transcriptLower.includes('internal server error');
+    const isDbIssue = transcriptLower.includes('database') || transcriptLower.includes('db') || transcriptLower.includes('connection pool') || transcriptLower.includes('max_connections');
+
+    // Case A: User explicitly provides or clarifies microservice name (e.g. "microservice name : oms")
+    if (
+      /microservice\s*(?:name)?\s*[:=]?\s*oms/i.test(latestUserText) ||
+      (detectedService === 'OMS' && (lastAssistantMsg.includes('Got it — the affected service is OMS') || lastAssistantMsg.includes('OMS p95/p99 latency')))
+    ) {
+      return (
+        'Confirmed — the affected microservice is OMS. Since the primary symptom is high API latency, ' +
+        'the next useful signal is whether the latency is coming from OMS itself or one of its dependencies. ' +
+        'Please provide the affected endpoint and, if available, current p95/p99 latency and database/downstream-call latency.'
+      );
+    }
+
+    // Case B: User answers a previous question with a service name like "oms"
+    if (
+      (latestLower === 'oms' || /^oms\b/i.test(latestUserText)) ||
+      (lastAssistantMsg.includes('What service is affected') && detectedService)
+    ) {
+      const serviceDisplay = detectedService || 'OMS';
+      return (
+        `Got it — the affected service is ${serviceDisplay}. Next, I’d check ${serviceDisplay} p95/p99 latency, ` +
+        `request rate, error rate, CPU/memory, database latency, downstream dependency latency, and whether there was a recent deployment or configuration change. ` +
+        `Do you have any of those metrics?`
+      );
+    }
+
+    // Case C: User provides metrics or latency telemetry
+    if (latestLower.includes('p99') || latestLower.includes('p95') || latestLower.includes('ms') || latestLower.includes('seconds') || latestLower.includes('qps')) {
+      const servicePrefix = detectedService ? `for **${detectedService}**` : '';
+      return (
+        `Telemetry registered ${servicePrefix}: High tail latency indicates contention or downstream saturation.\n\n` +
+        '**Immediate triage steps:**\n' +
+        '1. Check distributed tracing (Jaeger/Tempo/Datadog) to see if latency is spent in application logic, DB queries, or external HTTP calls.\n' +
+        '2. Inspect CPU throttling and garbage collection (GC) pauses on container pods.\n' +
+        '3. Are database connection pool metrics elevated or thread pools blocked?'
+      );
+    }
+
+    // Case D: User describes database issues
+    if (isDbIssue) {
+      return (
+        'Database connection timeouts can quickly trigger cascading failures across dependent microservices. When connection pools saturate, worker threads block waiting for available sockets.\n\n' +
+        '**Recommended actions:**\n' +
+        '1. Check active database connection counts against `max_connections`.\n' +
+        '2. Check for long-running transactions or unindexed slow queries holding row locks.\n' +
+        '3. Temporarily enable query read-replicas or shed non-critical background jobs.\n\n' +
+        'Are you seeing `MaxConnectionsExceeded` or query timeout errors in the database logs?'
+      );
+    }
+
+    // Case E: User describes HTTP 500 post-deployment
+    if (is500Issue || latestLower.includes('deploy')) {
       return (
         "I'm tracking the HTTP 500 error spike following today's deployment. In distributed environments, post-deployment 500s typically point to missing environment variables, database schema drift, or connection pool exhaustion.\n\n" +
         '**Immediate triage steps:**\n' +
@@ -147,25 +259,23 @@ export class MockAIService implements IAIService {
       );
     }
 
-    if (lastMsg.includes('db') || lastMsg.includes('database') || lastMsg.includes('timeout')) {
+    // Case F: Initial latency / slowness report without service specified
+    if (isLatencyIssue && !detectedService) {
       return (
-        'Database connection timeouts can quickly trigger cascading failures across dependent microservices. When connection pools saturate, worker threads block waiting for available sockets.\n\n' +
-        '**Recommended actions:**\n' +
-        '1. Check active database connection counts against `max_connections`.\n' +
-        '2. Check for long-running transactions or unindexed slow queries holding row locks.\n' +
-        '3. Temporarily enable query read-replicas or shedding non-critical batch workloads.\n\n' +
-        'Are you seeing `MaxConnectionsExceeded` or query timeout errors in the telemetry?'
+        'Understood. I’ll treat this as an API latency incident. ' +
+        'What service is affected, and do you have any p95/p99 latency, error-rate, traffic, or recent-deployment information?'
       );
     }
 
-    return (
-      `I have registered this update for incident **${incidentContext?.title || 'Active Incident'}**.\n\n` +
-      'As a senior production engineer, my primary focus is maintaining availability and minimizing MTTR.\n\n' +
+    // Case G: Default grounded response, ensuring anti-repetition
+    const fallbackResponse =
+      `I have registered this update regarding ${detectedService ? `microservice **${detectedService}**` : (incidentContext?.title || 'the active incident')}.\n\n` +
       '**Next actions:**\n' +
       '- Check metrics dashboards for error rates and p99 latency spikes.\n' +
-      '- Review recent configuration and infrastructure changes.\n\n' +
-      'Could you share the specific service name or any recent telemetry signals you have observed?'
-    );
+      '- Inspect recent configuration changes or container restarts.\n\n' +
+      'Could you share recent error log snippets or any observed bottleneck endpoints?';
+
+    return fallbackResponse;
   }
 
   async analyzeIncident(context: {
@@ -173,44 +283,55 @@ export class MockAIService implements IAIService {
     messages: ChatMessage[];
     currentAnalysis?: IncidentAnalysis | null;
   }): Promise<IncidentAnalysis> {
-    const transcript = context.messages.map(m => m.content.toLowerCase()).join(' ');
+    const transcript = context.messages.map(m => m.content).join('\n');
+    const lower = transcript.toLowerCase();
+
+    // Detect service name
+    let serviceName = 'Production API';
+    if (/oms\b/i.test(transcript)) serviceName = 'OMS';
+    else if (/payment\b/i.test(transcript)) serviceName = 'Payment Service';
+    else if (/auth\b/i.test(transcript)) serviceName = 'Auth Gateway';
 
     let severity: Severity = 'MEDIUM';
-    if (transcript.includes('500') || transcript.includes('payment') || transcript.includes('outage')) {
+    if (lower.includes('dead slow') || lower.includes('500') || lower.includes('payment') || lower.includes('outage')) {
       severity = 'HIGH';
     }
-    if (transcript.includes('critical') || transcript.includes('data loss') || transcript.includes('total')) {
+    if (lower.includes('critical') || lower.includes('data loss') || lower.includes('total')) {
       severity = 'CRITICAL';
     }
 
+    const title = context.title && !context.title.startsWith('Incident ')
+      ? context.title
+      : `${serviceName} API Latency & Slow Response Time Degradation`;
+
     return {
-      title: context.title || 'Production Service Degradation',
+      title,
       severity,
       symptoms: [
-        'HTTP 500 Internal Server Error rate spike',
-        'Downstream API response latency elevation',
-        'Customer checkout/workflow failures reported'
+        `Elevated tail latency and slow response times on ${serviceName}`,
+        'Upstream API callers experiencing response degradation',
+        'Customer workflow completion delays reported'
       ],
       possibleRootCauses: [
-        'Missing environment configuration in newly deployed container',
-        'Database connection pool exhaustion due to leaked transactions',
-        'Incompatible ORM schema migration applied during release'
+        `${serviceName} database connection pool saturation or unindexed query lock contention`,
+        'Downstream external dependency latency cascade',
+        'Recent container deployment or resource exhaustion (CPU throttling/GC pause)'
       ],
       investigationSteps: [
-        'Check stderr / exception logs for stack traces matching the 500 errors',
-        'Inspect database active connections, lock waits, and query latency',
-        'Diff release config variables between previous stable release and current release'
+        `Inspect ${serviceName} p95 and p99 latency percentiles and QPS rates`,
+        'Profile active database query execution times and connection pool depth',
+        'Inspect container CPU/Memory saturation and garbage collection metrics'
       ],
       recommendedActions: [
-        'Initiate canary/release rollback if customer impact exceeds 5 minutes',
-        'Enable circuit breaking or shedding non-critical background jobs',
-        'Scale worker replica count if CPU/Memory limits are saturated'
+        `Verify health of ${serviceName} upstream and downstream dependencies`,
+        'Consider shedding non-critical batch requests or enabling traffic rate limits',
+        'Prepare release rollback if latency spiked immediately after a new deployment'
       ],
       followUpQuestions: [
-        'What specific stack trace or exception is logged for the 500 errors?',
-        'Did the deployment include schema migrations or new database queries?'
+        `Which specific ${serviceName} endpoints are showing the highest latency?`,
+        'Are database connection limits or downstream API timeouts increasing?'
       ],
-      summary: `High-priority incident affecting service availability following recent deployment. Immediate rollback recommended if root cause cannot be isolated within 10 minutes.`
+      summary: `Active ${severity} severity latency degradation on ${serviceName}. Investigation focused on isolating downstream bottlenecks and database connection saturation.`
     };
   }
 
@@ -218,7 +339,7 @@ export class MockAIService implements IAIService {
     const md = `# Post-Incident Review: ${incident.title}
 
 ## Executive Summary
-On ${new Date(incident.createdAt).toLocaleDateString()}, a **${incident.severity}** severity incident affected production services. The incident was flagged when error rates surged following operational changes. Mitigation actions stabilized the service within the target MTTR window.
+On ${new Date(incident.createdAt).toLocaleDateString()}, a **${incident.severity}** severity incident affected production services. The incident was flagged when API tail latency and slow response times surged. Mitigation actions stabilized the service within the target MTTR window.
 
 ## Timeline
 ${incident.messages
@@ -226,17 +347,17 @@ ${incident.messages
   .join('\n')}
 
 ## Contributing Factors & Root Cause
-- **Primary Factor**: Code deployment introduced unhandled exception under high-concurrency traffic.
-- **Secondary Factor**: Downstream database connection limits were saturated by unpooled queries.
+- **Primary Factor**: Application downstream connection timeouts and thread pool contention.
+- **Secondary Factor**: Elevated query latency during peak traffic hours without caching.
 
 ## Recovery & Remediation Actions
-- **Immediate Mitigation**: Rolled back release to previous stable artifact.
-- **Verification**: Error rates returned to baseline (<0.01%); p99 latency normalized to 45ms.
+- **Immediate Mitigation**: Scaled container instances and shed non-critical traffic.
+- **Verification**: Error rates and p99 latency returned to baseline (<50ms).
 
 ## Preventative Action Items
-- [P0] Implement automated canary analysis with auto-rollback on elevated 5xx error rates.
+- [P0] Implement automated circuit breakers on downstream dependencies.
 - [P1] Add connection pool saturation alerts in Prometheus / Cloudflare Analytics.
-- [P2] Update developer runbook for emergency traffic shedding.
+- [P2] Configure automated p99 latency alerts with PagerDuty integration.
 `;
 
     return {
@@ -244,14 +365,14 @@ ${incident.messages
       title: incident.title,
       severity: incident.severity,
       status: incident.status,
-      executiveSummary: incident.analysis?.summary || 'Incident resolved after operational rollback.',
+      executiveSummary: incident.analysis?.summary || 'Incident resolved after operational stabilization.',
       timeline: incident.messages.map(m => ({
         timestamp: m.timestamp,
         description: `${m.role.toUpperCase()}: ${m.content.slice(0, 100)}`
       })),
-      rootCauseAnalysis: 'Post-deployment regression causing database pool starvation.',
-      mitigationTaken: ['Release rollback', 'Traffic shedding'],
-      preventativeMeasures: ['Automated canary gating', 'Database pool alerts'],
+      rootCauseAnalysis: 'Downstream dependency timeout causing thread starvation.',
+      mitigationTaken: ['Traffic shedding', 'Replica scaling'],
+      preventativeMeasures: ['Automated circuit breaking', 'Latency saturation alerts'],
       rawMarkdown: md,
       generatedAt: Date.now()
     };
